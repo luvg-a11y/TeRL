@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Sweep: serve each model with vLLM, evaluate on each benchmark with Harbor, tear down.
+#
+# One model is resident at a time — these do not co-fit on a single node.
+#
+#   ./run_eval.sh                 # full sweep
+#   ./run_eval.sh --list          # show the plan, touch nothing
+#   ./run_eval.sh --smoke         # 1 task, 1 attempt, 1 repeat
+#   MODELS=qwen3-4b ./run_eval.sh # restrict to one model
+set -euo pipefail
+
+# ---------------------------------------------------------------- config ----
+JOBS_DIR="${JOBS_DIR:-$PWD/jobs}"
+LOG_DIR="${LOG_DIR:-$PWD/logs}"
+PORT="${PORT:-8000}"
+HARBOR_ENV="${HARBOR_ENV:-docker}"        # docker | daytona | modal ...
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"   # matches Tmax training seq length
+GPU_UTIL="${GPU_UTIL:-0.90}"
+AGENT="${AGENT:-mini-swe-agent}"          # Tmax used a mini-swe-agent variant, not terminus-2
+K="${K:-5}"                               # attempts per task (paper: 5 rollouts)
+N_CONCURRENT="${N_CONCURRENT:-8}"
+REPEATS="${REPEATS:-3}"                   # paper repeats each eval 3x to reduce noise
+MAX_RETRIES="${MAX_RETRIES:-3}"           # paper restarts timed-out runs up to 3x
+# Paper retried TIMEOUTS, not all exceptions. Bare -r 3 would also retry real failures,
+# which inflates results by re-rolling genuine errors. Scope it. Set to "" to retry all.
+RETRY_INCLUDE="${RETRY_INCLUDE:-AgentTimeoutError VerifierTimeoutError AgentSetupTimeoutError EnvironmentStartTimeoutError}"
+LIMIT="${LIMIT:-}"                        # -l N, empty = all tasks
+AGENT_KWARGS="${AGENT_KWARGS:-}"          # e.g. "reasoning_effort=none"
+SERVE_TIMEOUT="${SERVE_TIMEOUT:-3600}"    # seconds to wait for vLLM (first run downloads weights)
+
+# name|hf_id|tensor_parallel|extra_vllm_args
+ALL_MODELS=(
+  "qwen3.5-2b|Qwen/Qwen3.5-2B|1|"
+  "qwen3.5-4b|Qwen/Qwen3.5-4B|1|"
+  "qwen3.5-9b|Qwen/Qwen3.5-9B|1|"
+  "qwen3.6-27b|Qwen/Qwen3.6-27B|1|"
+  "qwen3.6-35b-a3b|Qwen/Qwen3.6-35B-A3B|2|"
+)
+
+# label|dataset@version
+ALL_DATASETS=(
+  "tblite|openthoughts-tblite@2.0"
+  "tb2|terminal-bench@2.0"
+)
+
+# ------------------------------------------------------------------ args ----
+LIST_ONLY=0
+for a in "$@"; do
+  case "$a" in
+    --list)  LIST_ONLY=1 ;;
+    --smoke) K=1; REPEATS=1; LIMIT=1; N_CONCURRENT=1 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) echo "unknown arg: $a" >&2; exit 2 ;;
+  esac
+done
+
+# Optional filters: MODELS="qwen3-4b glm-4-9b"  DATASETS="tblite"
+select_rows() {  # $1 = filter string, rest = rows
+  local filter="$1"; shift
+  if [[ -z "$filter" ]]; then printf '%s\n' "$@"; return; fi
+  local row key
+  for row in "$@"; do
+    key="${row%%|*}"
+    if [[ " $filter " == *" $key "* ]]; then echo "$row"; fi
+  done
+}
+mapfile -t MODEL_ROWS   < <(select_rows "${MODELS:-}"   "${ALL_MODELS[@]}")
+mapfile -t DATASET_ROWS < <(select_rows "${DATASETS:-}" "${ALL_DATASETS[@]}")
+
+[[ ${#MODEL_ROWS[@]}   -gt 0 ]] || { echo "no models matched MODELS='${MODELS:-}'" >&2; exit 2; }
+[[ ${#DATASET_ROWS[@]} -gt 0 ]] || { echo "no datasets matched DATASETS='${DATASETS:-}'" >&2; exit 2; }
+
+# ----------------------------------------------------------------- utils ----
+log() { printf '\n\033[1m[%s] %s\033[0m\n' "$(date +%H:%M:%S)" "$*"; }
+die() { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+VLLM_PID=""
+stop_vllm() {
+  [[ -n "$VLLM_PID" ]] || return 0
+  log "stopping vLLM (pid $VLLM_PID)"
+  kill "$VLLM_PID" 2>/dev/null || true
+  # vLLM can take a while to release VRAM; wait, then force.
+  for _ in $(seq 1 60); do kill -0 "$VLLM_PID" 2>/dev/null || break; sleep 1; done
+  kill -9 "$VLLM_PID" 2>/dev/null || true
+  wait "$VLLM_PID" 2>/dev/null || true
+  VLLM_PID=""
+}
+trap 'stop_vllm' EXIT INT TERM
+
+wait_for_server() {
+  local deadline=$(( SECONDS + SERVE_TIMEOUT ))
+  while (( SECONDS < deadline )); do
+    if curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then return 0; fi
+    # If vLLM died, stop waiting for a server that is never coming.
+    if [[ -n "$VLLM_PID" ]] && ! kill -0 "$VLLM_PID" 2>/dev/null; then return 1; fi
+    sleep 5
+  done
+  return 1
+}
+
+# ------------------------------------------------------------------ plan ----
+log "plan"
+printf '  agent      %s\n  env        %s\n  k=%s n=%s repeats=%s%s\n' \
+  "$AGENT" "$HARBOR_ENV" "$K" "$N_CONCURRENT" "$REPEATS" \
+  "${LIMIT:+  limit=$LIMIT}"
+printf '  jobs       %s\n' "$JOBS_DIR"
+for mrow in "${MODEL_ROWS[@]}"; do
+  IFS='|' read -r mname mid mtp _ <<<"$mrow"
+  printf '  model      %-14s %-24s tp=%s\n' "$mname" "$mid" "$mtp"
+done
+for drow in "${DATASET_ROWS[@]}"; do
+  IFS='|' read -r dname did <<<"$drow"
+  printf '  dataset    %-14s %s\n' "$dname" "$did"
+done
+total=$(( ${#MODEL_ROWS[@]} * ${#DATASET_ROWS[@]} * REPEATS ))
+printf '  => %d harbor runs\n' "$total"
+[[ $LIST_ONLY -eq 1 ]] && exit 0
+
+# --------------------------------------------------------------- preflight --
+command -v vllm   >/dev/null || die "vllm not found"
+command -v harbor >/dev/null || die "harbor not found (uv tool install harbor)"
+command -v nvidia-smi >/dev/null || die "no nvidia-smi — this script needs a GPU host"
+if [[ "$HARBOR_ENV" == "docker" ]]; then
+  docker info >/dev/null 2>&1 || die "docker daemon unreachable. On a Runpod pod use HARBOR_ENV=daytona"
+fi
+case "$PWD" in "$HOME"/*) ;; *) echo "WARN: not under \$HOME; with colima the verifier cannot write back" >&2 ;; esac
+
+N_GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
+log "$N_GPU GPU(s) detected"
+mkdir -p "$JOBS_DIR" "$LOG_DIR"
+
+# ------------------------------------------------------------------ sweep ----
+FAILED=()
+for mrow in "${MODEL_ROWS[@]}"; do
+  IFS='|' read -r MNAME MID MTP MEXTRA <<<"$mrow"
+
+  if (( MTP > N_GPU )); then
+    echo "SKIP $MNAME: needs tensor-parallel $MTP, host has $N_GPU GPU(s)" >&2
+    FAILED+=("$MNAME: insufficient GPUs")
+    continue
+  fi
+
+  log "serving $MNAME  ($MID, tp=$MTP)"
+  # shellcheck disable=SC2086
+  vllm serve "$MID" \
+    --served-model-name "$MNAME" \
+    --port "$PORT" \
+    --tensor-parallel-size "$MTP" \
+    --max-model-len "$MAX_MODEL_LEN" \
+    --gpu-memory-utilization "$GPU_UTIL" \
+    $MEXTRA \
+    > "$LOG_DIR/vllm.$MNAME.log" 2>&1 &
+  VLLM_PID=$!
+
+  if ! wait_for_server; then
+    echo "SKIP $MNAME: vLLM did not become ready — see $LOG_DIR/vllm.$MNAME.log" >&2
+    tail -20 "$LOG_DIR/vllm.$MNAME.log" >&2 || true
+    FAILED+=("$MNAME: serve failed")
+    stop_vllm
+    continue
+  fi
+  log "$MNAME ready"
+
+  export OPENAI_BASE_URL="http://127.0.0.1:${PORT}/v1"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-dummy}"
+  export MSWEA_API_KEY="$OPENAI_API_KEY"   # mini-swe-agent reads its key here
+
+  for drow in "${DATASET_ROWS[@]}"; do
+    IFS='|' read -r DNAME DID <<<"$drow"
+    for rep in $(seq 1 "$REPEATS"); do
+      job="${MNAME}__${DNAME}__rep${rep}"
+      out="$JOBS_DIR/$job"
+      if [[ -f "$out/result.json" ]]; then
+        echo "  skip $job (already has result.json)"
+        continue
+      fi
+      log "run $job"
+      set +e
+      harbor run \
+        -d "$DID" \
+        -a "$AGENT" \
+        -m "openai/${MNAME}" \
+        -e "$HARBOR_ENV" \
+        -k "$K" \
+        -n "$N_CONCURRENT" \
+        -r "$MAX_RETRIES" \
+        $(for e in $RETRY_INCLUDE; do printf -- '--retry-include %s ' "$e"; done) \
+        --job-name "$job" \
+        -o "$JOBS_DIR" \
+        ${LIMIT:+-l "$LIMIT"} \
+        ${AGENT_KWARGS:+--ak "$AGENT_KWARGS"} \
+        2>&1 | tee "$LOG_DIR/harbor.$job.log"
+      rc=${PIPESTATUS[0]}
+      set -e
+      [[ $rc -eq 0 ]] || FAILED+=("$job (exit $rc)")
+    done
+  done
+
+  stop_vllm
+done
+
+# ---------------------------------------------------------------- summary ----
+log "summary"
+python3 "$(dirname "$0")/summarize.py" "$JOBS_DIR" 2>/dev/null || echo "(run summarize.py for a table)"
+
+if (( ${#FAILED[@]} )); then
+  printf '\n\033[31m%d failure(s):\033[0m\n' "${#FAILED[@]}"
+  printf '  - %s\n' "${FAILED[@]}"
+  exit 1
+fi
+log "all runs completed"
