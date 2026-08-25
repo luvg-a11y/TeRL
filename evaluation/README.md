@@ -11,6 +11,9 @@ Use slime's image so training and evaluation share one environment — same SGLa
 (`v0.5.15.post1`, CUDA 12.9) and the same slime patches applied to it.
 
 ```bash
+# Pulls the prebuilt slimerl/slime image and layers Harbor on top.
+# Nothing in SGLang/torch/CUDA is recompiled. First pull is large (~20-40 GB);
+# rebuilds after that are seconds, since only the tool layers change.
 docker build -t terl-eval -f evaluation/Dockerfile .
 
 docker run --rm -it --gpus all --ipc=host --shm-size=16g \

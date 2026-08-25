@@ -1,0 +1,4 @@
+# The eval Dockerfile COPYs nothing — it only layers tools onto slimerl/slime.
+# Without this, `docker build .` ships the whole repo (~356 MB, mostly .git) to
+# the daemon for no reason.
+*
