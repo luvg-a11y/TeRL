@@ -5,6 +5,9 @@ Evaluate checkpoints on Terminal-Bench Lite and Terminal-Bench 2.0 with Harbor.
 Requires a GPU host. Background and design rationale: [NOTES.md](./NOTES.md).
 No GPU: [LOCAL_TESTING.md](./LOCAL_TESTING.md).
 
+Claude Code users: the `terl-eval` skill (`.claude/skills/terl-eval/`) loads this
+procedure and its failure modes automatically.
+
 ## Install
 
 Use slime's image so training and evaluation share one environment — same SGLang
