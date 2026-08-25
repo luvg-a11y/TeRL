@@ -11,6 +11,7 @@ No GPU: [LOCAL_TESTING.md](./LOCAL_TESTING.md).
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 uv tool install harbor
+pip install "sglang[all]"
 ```
 
 ## Single run
@@ -18,8 +19,9 @@ uv tool install harbor
 ```bash
 # serve (leave running)
 export HF_HOME=/workspace/hf
-vllm serve Qwen/Qwen3.5-9B --served-model-name m --port 8000 \
-  --max-model-len 65536 --gpu-memory-utilization 0.90
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-9B \
+  --served-model-name m --host 127.0.0.1 --port 8000 \
+  --context-length 65536 --mem-fraction-static 0.90
 
 # evaluate
 export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
@@ -45,7 +47,7 @@ Resumable: jobs with an existing `result.json` are skipped.
 
 Filter: `MODELS="qwen3.5-9b qwen3.6-27b" DATASETS=tblite ./run_eval.sh`
 
-Override: `K` `REPEATS` `N_CONCURRENT` `LIMIT` `HARBOR_ENV` `AGENT_KWARGS` `MAX_MODEL_LEN` `GPU_UTIL`
+Override: `K` `REPEATS` `N_CONCURRENT` `LIMIT` `HARBOR_ENV` `AGENT_KWARGS` `CONTEXT_LENGTH` `MEM_FRACTION`
 
 ## Models
 
@@ -88,7 +90,7 @@ zero, so a broken run still reports a plausible number.
 | --- | --- |
 | `Docker is not installed or not on PATH` | `-e daytona`; a Runpod pod cannot run Docker |
 | `RewardFileNotFoundError`, empty `verifier/` | job dir not visible to the runtime; keep `-o` under `/workspace` |
-| Many timeouts | vLLM too slow: lower `N_CONCURRENT`, check `nvidia-smi` |
+| Many timeouts | SGLang too slow: lower `N_CONCURRENT`, check `nvidia-smi` |
 | OOM on 27B / 35B | raise TP, lower `N_CONCURRENT`, or `--quantization fp8` |
 | Empty agent trajectories | `AGENT_KWARGS=reasoning_effort=none` |
 | Torch/CUDA mismatch on pod boot | redeploy with CUDA pinned in the filters |

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sweep: serve each model with vLLM, evaluate on each benchmark with Harbor, tear down.
+# Sweep: serve each model with SGLang, evaluate on each benchmark with Harbor, tear down.
 #
 # One model is resident at a time — these do not co-fit on a single node.
 #
@@ -14,8 +14,8 @@ JOBS_DIR="${JOBS_DIR:-$PWD/jobs}"
 LOG_DIR="${LOG_DIR:-$PWD/logs}"
 PORT="${PORT:-8000}"
 HARBOR_ENV="${HARBOR_ENV:-docker}"        # docker | daytona | modal ...
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}"   # matches Tmax training seq length
-GPU_UTIL="${GPU_UTIL:-0.90}"
+CONTEXT_LENGTH="${CONTEXT_LENGTH:-65536}" # SGLang --context-length
+MEM_FRACTION="${MEM_FRACTION:-0.90}"      # SGLang --mem-fraction-static (weights + KV pool)
 AGENT="${AGENT:-mini-swe-agent}"          # Tmax used a mini-swe-agent variant, not terminus-2
 K="${K:-5}"                               # attempts per task (paper: 5 rollouts)
 N_CONCURRENT="${N_CONCURRENT:-8}"
@@ -26,9 +26,9 @@ MAX_RETRIES="${MAX_RETRIES:-3}"           # paper restarts timed-out runs up to 
 RETRY_INCLUDE="${RETRY_INCLUDE:-AgentTimeoutError VerifierTimeoutError AgentSetupTimeoutError EnvironmentStartTimeoutError}"
 LIMIT="${LIMIT:-}"                        # -l N, empty = all tasks
 AGENT_KWARGS="${AGENT_KWARGS:-}"          # e.g. "reasoning_effort=none"
-SERVE_TIMEOUT="${SERVE_TIMEOUT:-3600}"    # seconds to wait for vLLM (first run downloads weights)
+SERVE_TIMEOUT="${SERVE_TIMEOUT:-3600}"    # seconds to wait for SGLang (first run downloads weights)
 
-# name|hf_id|tensor_parallel|extra_vllm_args
+# name|hf_id|tp_size|extra_sglang_args
 ALL_MODELS=(
   "qwen3.5-2b|Qwen/Qwen3.5-2B|1|"
   "qwen3.5-4b|Qwen/Qwen3.5-4B|1|"
@@ -74,25 +74,25 @@ mapfile -t DATASET_ROWS < <(select_rows "${DATASETS:-}" "${ALL_DATASETS[@]}")
 log() { printf '\n\033[1m[%s] %s\033[0m\n' "$(date +%H:%M:%S)" "$*"; }
 die() { printf '\033[31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
-VLLM_PID=""
-stop_vllm() {
-  [[ -n "$VLLM_PID" ]] || return 0
-  log "stopping vLLM (pid $VLLM_PID)"
-  kill "$VLLM_PID" 2>/dev/null || true
-  # vLLM can take a while to release VRAM; wait, then force.
-  for _ in $(seq 1 60); do kill -0 "$VLLM_PID" 2>/dev/null || break; sleep 1; done
-  kill -9 "$VLLM_PID" 2>/dev/null || true
-  wait "$VLLM_PID" 2>/dev/null || true
-  VLLM_PID=""
+SERVER_PID=""
+stop_server() {
+  [[ -n "$SERVER_PID" ]] || return 0
+  log "stopping SGLang (pid $SERVER_PID)"
+  kill "$SERVER_PID" 2>/dev/null || true
+  # SGLang can take a while to release VRAM; wait, then force.
+  for _ in $(seq 1 60); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 1; done
+  kill -9 "$SERVER_PID" 2>/dev/null || true
+  wait "$SERVER_PID" 2>/dev/null || true
+  SERVER_PID=""
 }
-trap 'stop_vllm' EXIT INT TERM
+trap 'stop_server' EXIT INT TERM
 
 wait_for_server() {
   local deadline=$(( SECONDS + SERVE_TIMEOUT ))
   while (( SECONDS < deadline )); do
     if curl -sf "http://127.0.0.1:${PORT}/v1/models" >/dev/null 2>&1; then return 0; fi
-    # If vLLM died, stop waiting for a server that is never coming.
-    if [[ -n "$VLLM_PID" ]] && ! kill -0 "$VLLM_PID" 2>/dev/null; then return 1; fi
+    # If SGLang died, stop waiting for a server that is never coming.
+    if [[ -n "$SERVER_PID" ]] && ! kill -0 "$SERVER_PID" 2>/dev/null; then return 1; fi
     sleep 5
   done
   return 1
@@ -117,7 +117,7 @@ printf '  => %d harbor runs\n' "$total"
 [[ $LIST_ONLY -eq 1 ]] && exit 0
 
 # --------------------------------------------------------------- preflight --
-command -v vllm   >/dev/null || die "vllm not found"
+python -c "import sglang" 2>/dev/null || die "sglang not importable (pip install 'sglang[all]')"
 command -v harbor >/dev/null || die "harbor not found (uv tool install harbor)"
 command -v nvidia-smi >/dev/null || die "no nvidia-smi — this script needs a GPU host"
 if [[ "$HARBOR_ENV" == "docker" ]]; then
@@ -142,21 +142,23 @@ for mrow in "${MODEL_ROWS[@]}"; do
 
   log "serving $MNAME  ($MID, tp=$MTP)"
   # shellcheck disable=SC2086
-  vllm serve "$MID" \
+  python -m sglang.launch_server \
+    --model-path "$MID" \
     --served-model-name "$MNAME" \
+    --host 127.0.0.1 \
     --port "$PORT" \
-    --tensor-parallel-size "$MTP" \
-    --max-model-len "$MAX_MODEL_LEN" \
-    --gpu-memory-utilization "$GPU_UTIL" \
+    --tp-size "$MTP" \
+    --context-length "$CONTEXT_LENGTH" \
+    --mem-fraction-static "$MEM_FRACTION" \
     $MEXTRA \
-    > "$LOG_DIR/vllm.$MNAME.log" 2>&1 &
-  VLLM_PID=$!
+    > "$LOG_DIR/sglang.$MNAME.log" 2>&1 &
+  SERVER_PID=$!
 
   if ! wait_for_server; then
-    echo "SKIP $MNAME: vLLM did not become ready — see $LOG_DIR/vllm.$MNAME.log" >&2
-    tail -20 "$LOG_DIR/vllm.$MNAME.log" >&2 || true
+    echo "SKIP $MNAME: SGLang did not become ready — see $LOG_DIR/sglang.$MNAME.log" >&2
+    tail -20 "$LOG_DIR/sglang.$MNAME.log" >&2 || true
     FAILED+=("$MNAME: serve failed")
-    stop_vllm
+    stop_server
     continue
   fi
   log "$MNAME ready"
@@ -196,7 +198,7 @@ for mrow in "${MODEL_ROWS[@]}"; do
     done
   done
 
-  stop_vllm
+  stop_server
 done
 
 # ---------------------------------------------------------------- summary ----
