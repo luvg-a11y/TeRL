@@ -10,7 +10,7 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- config ----
-JOBS_DIR="${JOBS_DIR:-$PWD/jobs}"
+JOBS_DIR="${JOBS_DIR:-$PWD/jobs}"   # keep on a path shared with the docker host
 LOG_DIR="${LOG_DIR:-$PWD/logs}"
 PORT="${PORT:-8000}"
 HARBOR_ENV="${HARBOR_ENV:-docker}"        # docker | daytona | modal ...
@@ -123,7 +123,12 @@ command -v nvidia-smi >/dev/null || die "no nvidia-smi — this script needs a G
 if [[ "$HARBOR_ENV" == "docker" ]]; then
   docker info >/dev/null 2>&1 || die "docker daemon unreachable. On a Runpod pod use HARBOR_ENV=daytona"
 fi
-case "$PWD" in "$HOME"/*) ;; *) echo "WARN: not under \$HOME; with colima the verifier cannot write back" >&2 ;; esac
+# Harbor bind-mounts JOBS_DIR into task containers; the daemon resolves that path on the
+# HOST. Inside slime's image that only works if the path is mounted identically on both
+# sides. Mismatch => RewardFileNotFoundError with an empty verifier/.
+if [[ -f /.dockerenv && "$HARBOR_ENV" == "docker" ]]; then
+  echo "NOTE: running inside a container; $JOBS_DIR must be bind-mounted at the same path on the host" >&2
+fi
 
 N_GPU=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l | tr -d ' ')
 log "$N_GPU GPU(s) detected"

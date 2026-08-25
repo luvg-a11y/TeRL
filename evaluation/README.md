@@ -7,12 +7,44 @@ No GPU: [LOCAL_TESTING.md](./LOCAL_TESTING.md).
 
 ## Install
 
+Use slime's image so training and evaluation share one environment — same SGLang
+(`v0.5.15.post1`, CUDA 12.9) and the same slime patches applied to it.
+
+```bash
+docker build -t terl-eval -f evaluation/Dockerfile .
+
+docker run --rm -it --gpus all --ipc=host --shm-size=16g \
+  --ulimit memlock=-1 --ulimit stack=67108864 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /workspace:/workspace \
+  terl-eval /bin/bash
+```
+
+The two mounts matter:
+
+- **docker.sock** lets Harbor drive the *host* daemon and create sibling containers.
+  Without it Harbor has no runtime and every trial fails.
+- **`/workspace` at the same path on both sides.** Harbor bind-mounts the job directory
+  into task containers, and the host daemon resolves that path on the host. Mismatched
+  paths give `RewardFileNotFoundError` with an empty `verifier/`.
+
+Keep `-o /workspace/jobs` for the same reason.
+
+No host daemon (a Runpod pod has none): skip the socket mount and use `-e daytona`.
+
+<details>
+<summary>Without Docker</summary>
+
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 uv tool install harbor
-pip install "sglang[all]"
+pip install "sglang[all]==0.5.15.post1"     # must match slime's pin
 ```
+
+slime patches SGLang internals against that exact version, so an unpinned install
+diverges from your training environment.
+</details>
 
 ## Single run
 
@@ -28,7 +60,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:8000/v1
 export OPENAI_API_KEY=dummy
 export MSWEA_API_KEY=dummy
 
-harbor run -d openthoughts-tblite@2.0 -a mini-swe-agent -m openai/m -k 5 -n 8
+harbor run -d openthoughts-tblite@2.0 -a mini-swe-agent -m openai/m -k 5 -n 8 -o /workspace/jobs
 ```
 
 Add `-e daytona` (with `DAYTONA_API_KEY`) if the host has no Docker daemon — a Runpod pod
